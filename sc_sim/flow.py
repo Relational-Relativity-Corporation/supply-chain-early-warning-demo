@@ -9,8 +9,27 @@ def init_pipelines(G):
 
 
 def _step(G, pipelines):
+    """
+    Advance simulation by one discrete time step.
+
+    Structural pass ordering is mandatory and must not be collapsed:
+
+      Pass 1 — Arrivals:   deliver pipeline heads to destination nodes
+      Pass 2 — Production: suppliers generate inventory
+      Pass 3 — Retail:     serve demand and accumulate backlog
+      Pass 4 — Shipments:  upstream nodes dispatch to downstream pipes
+
+    Collapsing any two passes into one loop produces incorrect dynamics
+    because downstream inventory must be fully updated before shipments
+    are calculated, and backlog must be resolved before new shipments
+    are dispatched.
+    """
     nodes = G.nodes
 
+    # ------------------------------------------------------------------
+    # Pass 1 & 2 — Arrivals + Production
+    # Deliver pipeline heads; suppliers add production to inventory.
+    # ------------------------------------------------------------------
     arrivals = {n: 0.0 for n in nodes}
     for (u, v), pipe in pipelines.items():
         arrivals[v] += pipe[0]
@@ -24,6 +43,13 @@ def _step(G, pipelines):
             inc += data['production_rate']
         data['inventory'] = min(data['capacity'], data['inventory'] + inc)
 
+    # ------------------------------------------------------------------
+    # Pass 3 — Retail Serving
+    # Resolve backlog and current demand against available inventory.
+    # Backlog is served first (FIFO priority).
+    # Non-negativity of backlog is guaranteed:
+    #   served <= inventory, bl_srv <= backlog, dm_srv <= demand
+    # ------------------------------------------------------------------
     for nid, data in nodes(data=True):
         if data['kind'] != 'retail':
             continue
@@ -34,6 +60,13 @@ def _step(G, pipelines):
         data['backlog']   += data['demand'] - dm_srv
         data['backlog']   -= bl_srv
 
+    # ------------------------------------------------------------------
+    # Pass 4 — Shipments
+    # Each non-leaf node dispatches inventory proportionally to
+    # downstream throughput limits.
+    # sum(shipments) <= avail is guaranteed by proportional allocation,
+    # so inventory remains non-negative.
+    # ------------------------------------------------------------------
     for nid, data in nodes(data=True):
         succ = list(G.successors(nid))
         if not succ:
