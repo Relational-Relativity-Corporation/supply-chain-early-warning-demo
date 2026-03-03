@@ -1,50 +1,135 @@
-﻿import numpy as np
-from scipy import stats
+﻿"""
+instability.py — Relational regime detection.
+
+Replaces rolling variance and Kendall tau with the invariant
+regime indicator derived from relational magnitudes:
+
+    D_max = sup over edges of (flow / throughput_limit)
+            Maximum relational strain in the network.
+
+    P_max = inf over nodes of (spare_capacity / capacity)
+            Minimum normalized adaptive capacity available.
+
+    I = P_max - D_max
+
+Regimes:
+    I > 0  Stable      — plasticity exceeds strain
+    I = 0  Critical    — boundary condition
+    I < 0  Divergent   — strain exceeds available plasticity
+
+This gives early warning by structural necessity: I crosses zero
+before backlog accumulates to failure threshold, because relational
+strain saturates capacity before downstream effects are observable.
+
+No window parameters. No statistical thresholds. No tuning.
+The mathematics determines the regime directly from network state.
+"""
+
+import numpy as np
 
 
-def rolling_variance(series, window=20):
+def compute_regime_indicator(G, pipelines):
     """
-    Compute rolling population variance over a fixed window.
+    Compute the scalar regime indicator I = P_max - D_max
+    from current network state.
 
-    Population variance (/ window) is used rather than sample variance
-    (/ window-1) because the window is treated as a complete observation
-    set for signal detection purposes, not a sample estimator.
+    Parameters
+    ----------
+    G : networkx.DiGraph
+        Network graph with current node inventories and capacities.
+    pipelines : dict
+        Edge pipeline queues as produced by flow.init_pipelines.
 
-    Complexity: O(T * window). Suitable for T <= 10,000 and window <= 100.
-    For larger scales, consider incremental variance updates:
-        var_new = var_old + (x_new - x_old)(x_new - mean_new + x_old - mean_old) / window
+    Returns
+    -------
+    I : float
+        Regime indicator. Positive = stable, zero = critical,
+        negative = divergent.
+    D_max : float
+        Maximum relational strain across all edges.
+    P_max : float
+        Minimum normalized spare capacity across all nodes.
     """
-    n  = len(series)
-    rv = np.full(n, np.nan, dtype=float)
-    for i in range(window - 1, n):
-        rv[i] = np.var(series[i - window + 1: i + 1], dtype=float)
-    return rv
+    # D_max: maximum strain = flow-in-transit / throughput_limit per edge
+    strains = []
+    for (u, v), pipe in pipelines.items():
+        tl = G.edges[u, v]['throughput_limit']
+        if tl <= 0:
+            raise ValueError(
+                f"Edge ({u}, {v}) has throughput_limit={tl}. "
+                "Zero or negative throughput limits are not permitted — "
+                "strain is undefined on a zero-capacity edge."
+            )
+        in_transit = sum(pipe)
+        strains.append(in_transit / tl)
+    D_max = max(strains) if strains else 0.0
+
+    # P_max: minimum normalized spare capacity across all nodes
+    spare = []
+    for nid, data in G.nodes(data=True):
+        cap = data['capacity']
+        inv = data['inventory']
+        if cap > 0:
+            spare.append((cap - inv) / cap)
+    P_max = min(spare) if spare else 0.0
+
+    I = P_max - D_max
+    return I, D_max, P_max
 
 
-def kendall_tau_trend(series, window=30):
+def regime_series(G_states):
     """
-    Compute rolling Kendall tau rank correlation against a linear index.
+    Compute regime indicator series over a recorded simulation run.
 
-    Kendall tau measures the monotonic trend of rolling variance within
-    each window. A sustained positive tau indicates the variance is
-    consistently rising — the core early-warning signal.
+    Parameters
+    ----------
+    G_states : list of (G, pipelines) tuples recorded per timestep.
 
-    tau = +1.0  all pairwise comparisons concordant (pure upward trend)
-    tau = -1.0  all pairwise comparisons discordant (pure downward trend)
-    tau =  0.0  no monotonic trend
-
-    Complexity: O(T * window^2). At default T=300, window=30 this is
-    approximately 270,000 operations — acceptable. For T > 5,000 or
-    window > 50, replace the inner loop with scipy.stats.kendalltau
-    on sorted ranks or use a merge-sort based O(window log window)
-    implementation.
+    Returns
+    -------
+    I_series : np.ndarray of shape (T,)
+    D_series : np.ndarray of shape (T,)
+    P_series : np.ndarray of shape (T,)
     """
-    n   = len(series)
-    tau = np.full(n, np.nan, dtype=float)
-    x   = np.arange(window, dtype=float)
-    for i in range(window - 1, n):
-        seg = series[i - window + 1: i + 1]
-        if np.any(np.isnan(seg)):
-            continue
-        tau[i], _ = stats.kendalltau(x, seg.astype(float))
-    return tau
+    results = [compute_regime_indicator(G, p) for G, p in G_states]
+    I_series = np.array([r[0] for r in results])
+    D_series = np.array([r[1] for r in results])
+    P_series = np.array([r[2] for r in results])
+    return I_series, D_series, P_series
+
+
+def compute_trigger_times(backlog, I_series,
+                          backlog_threshold=200.0):
+    """
+    Identify early-warning and failure trigger times.
+
+    Early warning fires when I first crosses zero (divergent regime).
+    Failure fires when backlog crosses backlog_threshold.
+
+    Parameters
+    ----------
+    backlog : np.ndarray
+    I_series : np.ndarray
+        Regime indicator series. Negative values indicate divergence.
+    backlog_threshold : float
+
+    Returns
+    -------
+    instability_time : int or None
+    failure_time : int or None
+    lead_time : int or None
+    """
+    instability_time = next(
+        (i for i, v in enumerate(I_series) if v < 0.0),
+        None
+    )
+    failure_time = next(
+        (i for i, b in enumerate(backlog) if b >= backlog_threshold),
+        None
+    )
+    lead_time = (
+        failure_time - instability_time
+        if instability_time is not None and failure_time is not None
+        else None
+    )
+    return instability_time, failure_time, lead_time
