@@ -5,17 +5,10 @@ Retail serving and shipment dispatch use the bounded update operator:
 
     delta_M = clip(E - M, P_max)
 
-where:
-    E     = target state (demand + backlog for retail,
-                          proportional share for dispatch)
-    M     = current inventory
-    P_max = throughput or serving limit
-
-This replaces the multi-branch conditional logic of the original
-implementation with a single relational operator that enforces
-magnitude constraints continuously. The four-pass ordering is
-preserved — structural correctness requires it regardless of
-which operator governs each pass.
+Pipelines are pre-filled with steady-state flow values so the
+simulation starts in equilibrium rather than cold. This eliminates
+the startup transient where retail inventory depletes before the
+first pipeline deliveries arrive.
 """
 
 import numpy as np
@@ -27,26 +20,29 @@ def _bounded_update(current, target, p_max):
 
         delta_M = clip(target - current, p_max)
 
-    Returns the signed update delta_M. The caller applies it.
-
-    Parameters
-    ----------
-    current : float  Current state M.
-    target  : float  Target state E.
-    p_max   : float  Maximum permitted magnitude of update.
-
-    Returns
-    -------
-    delta_M : float  Bounded update. Sign indicates direction.
+    Returns the signed update delta_M.
     """
     return float(np.clip(target - current, -p_max, p_max))
 
 
 def init_pipelines(G):
-    return {
-        (u, v): [0.0] * max(1, int(data.get('transport_delay', 1)))
-        for u, v, data in G.edges(data=True)
-    }
+    """
+    Initialise pipelines pre-filled with steady-state flow.
+
+    Each pipeline slot is filled with the edge throughput_limit
+    divided by the number of delay slots, approximating the
+    steady-state per-slot flow. This starts the simulation in
+    equilibrium and eliminates the cold-start transient.
+    """
+    pipelines = {}
+    for u, v, data in G.edges(data=True):
+        delay     = max(1, int(data.get('transport_delay', 1)))
+        tl        = data['throughput_limit']
+        # Steady-state fill: each slot carries tl / delay units
+        # so total in-transit equals throughput_limit at t=0
+        fill      = tl / delay
+        pipelines[(u, v)] = [fill] * delay
+    return pipelines
 
 
 def _step(G, pipelines):
@@ -54,20 +50,14 @@ def _step(G, pipelines):
     Advance simulation by one discrete time step.
 
     Pass ordering is mandatory:
-
-      Pass 1 — Arrivals:   deliver pipeline heads to destination nodes
-      Pass 2 — Production: suppliers generate inventory
-      Pass 3 — Retail:     serve demand via bounded update operator
-      Pass 4 — Shipments:  dispatch via bounded update operator
-
-    The bounded update operator replaces conditional branching in
-    passes 3 and 4. The relational structure — magnitude constraint
-    between error and capacity — governs both.
+      Pass 1 — Arrivals + Production
+      Pass 2 — Retail serving via bounded update operator
+      Pass 3 — Shipments via bounded update operator
     """
     nodes = G.nodes
 
     # ------------------------------------------------------------------
-    # Pass 1 & 2 — Arrivals + Production
+    # Pass 1 — Arrivals + Production
     # ------------------------------------------------------------------
     arrivals = {n: 0.0 for n in nodes}
     for (u, v), pipe in pipelines.items():
@@ -83,34 +73,21 @@ def _step(G, pipelines):
         data['inventory'] = min(data['capacity'], data['inventory'] + inc)
 
     # ------------------------------------------------------------------
-    # Pass 3 — Retail Serving via bounded update operator
-    #
-    # Target E = backlog + demand (full obligation)
-    # Current M = inventory
-    # P_max = inventory (can only serve what exists)
-    #
-    # delta_M = clip(E - M, P_max) gives maximum serving within
-    # available inventory. Backlog is reduced by what was served
-    # beyond current demand.
+    # Pass 2 — Retail Serving via bounded update operator
     # ------------------------------------------------------------------
     for nid, data in nodes(data=True):
         if data['kind'] != 'retail':
             continue
-        obligation = data['backlog'] + data['demand']
-        delta_M    = _bounded_update(0.0, obligation, data['inventory'])
-        served     = abs(delta_M)
+        obligation  = data['backlog'] + data['demand']
+        delta_M     = _bounded_update(0.0, obligation, data['inventory'])
+        served      = abs(delta_M)
         bl_resolved = min(served, data['backlog'])
         data['inventory'] -= served
         data['backlog']   -= bl_resolved
         data['backlog']   += data['demand'] - (served - bl_resolved)
 
     # ------------------------------------------------------------------
-    # Pass 4 — Shipments via bounded update operator
-    #
-    # For each downstream edge, target share is proportional to
-    # throughput limit. P_max = throughput_limit per edge.
-    # delta_M = clip(share - 0, throughput_limit) = min(share, tl)
-    # which is exactly the relational dispatch constraint.
+    # Pass 3 — Shipments via bounded update operator
     # ------------------------------------------------------------------
     for nid, data in nodes(data=True):
         succ = list(G.successors(nid))
@@ -119,10 +96,9 @@ def _step(G, pipelines):
         total_tl = sum(G.edges[nid, v]['throughput_limit'] for v in succ)
         if total_tl <= 0:
             raise ValueError(
-                f"Node {nid} has total downstream throughput_limit={total_tl}. "
-                "Shipment dispatch requires at least one edge with positive throughput."
+                f"Node {nid} has total downstream throughput_limit={total_tl}."
             )
-        avail = data['inventory']
+        avail     = data['inventory']
         shipments = {}
         for v in succ:
             tl    = G.edges[nid, v]['throughput_limit']
@@ -138,13 +114,12 @@ def _step(G, pipelines):
 
 def simulate(G, T=300, disruption_fn=None):
     """
-    Run simulation for T steps, recording regime state each step.
+    Run simulation for T steps recording regime state each step.
 
     Returns
     -------
-    backlog     : np.ndarray shape (T,)
-    G_states    : list of (G_snapshot, pipelines_snapshot) per step
-                  for regime indicator computation.
+    backlog  : np.ndarray shape (T,)
+    G_states : list of (G_snapshot, pipelines_snapshot) per step
     """
     import copy
     pipelines = init_pipelines(G)
