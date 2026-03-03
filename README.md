@@ -1,18 +1,29 @@
 ﻿# Supply Chain Early Warning Demo
 
 Discrete-time simulation of a small supply network demonstrating
-measurable early detection of cascading overload before failure.
+structural early detection of cascading overload before failure.
 
-The detection mechanism is grounded in **critical slowing down** — a
-phenomenon from dynamical systems theory in which a system approaching
-a bifurcation or threshold transition exhibits increasing variance and
-autocorrelation in observable signals before the transition occurs.
-This demo operationalizes that signal using rolling variance and
-Kendall tau trend detection on total system backlog.
+The detection mechanism is the **relational regime indicator**:
+
+```
+I = P_max - D_max
+```
+
+| Symbol | Definition |
+|--------|-----------|
+| `D_max` | Maximum relational strain across all edges — flow in transit divided by throughput limit |
+| `P_max` | Minimum normalised spare capacity across all nodes |
+| `I`     | Regime indicator. Positive = stable, zero = critical, negative = divergent |
+
+When `I` crosses zero the network is structurally divergent. This crossing
+precedes observable backlog accumulation by a measurable lead time — providing
+early warning without statistical inference, sliding windows, or tuning parameters.
+
+---
 
 ## Network
 
-- 3 suppliers -> 4 warehouses -> 5 retail nodes
+- 3 suppliers → 4 warehouses → 5 retail nodes
 - Edges carry goods with transport delay and throughput limits
 - Total nominal demand: 72 units/step
 - Total nominal production: 120 units/step (surplus under normal conditions)
@@ -20,28 +31,35 @@ Kendall tau trend detection on total system backlog.
 
 ## Disruption
 
-At t=150, warehouse W1 suffers a severe capacity drop (200 -> 15).
+At t=150, warehouse W1 suffers a severe capacity drop (200 → 20).
 Downstream retail nodes R1 and R2 begin accumulating backlog.
 The cascade propagates as upstream suppliers continue producing
 into a blocked network.
 
 ## Detection
 
-Rolling variance of total backlog rises before the backlog crosses
-the failure threshold. Kendall tau trend of rolling variance confirms
-sustained monotonic onset rather than a transient spike.
+The regime indicator `I = P_max - D_max` is computed directly from
+network state at each timestep. When strain exceeds spare capacity,
+`I` crosses zero — the system has entered the divergent regime.
 
-The early warning signal precedes declared failure by a measurable
-lead time — see output for the specific step count under default parameters.
+This structural crossing precedes the backlog failure threshold by
+a measurable lead time. See console output for the exact step count
+under default parameters.
 
-### Threshold Basis
+No thresholds to tune on the detection side. The mathematics
+determines the regime.
 
-- `tau_threshold = 0.60` — tau >= 0.60 indicates >80% concordant pairs,
-  reducing false positives from transient variance spikes. Tunable:
-  lower values increase sensitivity, higher values improve specificity.
-- `backlog_threshold = 200.0` — approximately 2.8x nominal demand,
-  representing severe service degradation. Should be recalibrated
-  if network parameters are changed.
+## Results
+
+![Regime Early Warning](results/regime_early_warning.png)
+
+Four panels:
+1. **Total backlog** — conventional failure signal
+2. **Regime indicator I** — zero crossing marks structural warning
+3. **D_max and P_max** — relational components
+4. **Regime classification** — stable / divergent zones with lead time annotated
+
+---
 
 ## Run
 
@@ -50,22 +68,49 @@ pip install -e .
 python experiments/run_demo.py
 ```
 
-## Scaling Notes
+Results saved to `results/regime_early_warning.png`.
 
-The Kendall tau computation is O(T * window^2). At default parameters
-(T=300, window=30) this is ~270,000 operations. For T > 5,000 or
-window > 50, replace with a merge-sort based O(window log window)
-implementation or use incremental variance updates.
+The notebook at `notebooks/demo.ipynb` reproduces the same analysis interactively.
 
 ## Dependencies
 
-numpy, networkx, scipy, matplotlib
+numpy, networkx, matplotlib
 
-## Background
+## Repository Structure
 
-Critical slowing down as a precursor to system transitions is
-documented across ecology, climate systems, and financial networks.
-This demo applies the same detection principle to discrete supply
-chain dynamics. Key reference:
-Scheffer et al. (2009), "Early-warning signals for critical transitions",
-Nature 461, 53-59. https://doi.org/10.1038/nature08227
+```
+supply-chain-early-warning-demo/
+├── experiments/
+│   └── run_demo.py          — main simulation and plot script
+├── notebooks/
+│   └── demo.ipynb           — interactive walkthrough
+├── sc_sim/
+│   ├── network.py           — 3-4-5 supply network definition
+│   ├── flow.py              — simulation loop, bounded update operator
+│   ├── disruption.py        — capacity drop injection
+│   └── instability.py       — regime indicator I = P_max - D_max
+├── results/                 — generated plots
+├── pyproject.toml
+└── README.md
+```
+
+Note: `metrics.py` is deprecated and will be removed in a future release.
+`compute_trigger_times` now lives in `instability.py`.
+
+---
+
+## Mathematical Background
+
+The regime indicator is an instance of the invariant relational operator:
+
+```
+ΔM = clip(E - M, P_max)
+```
+
+where the stability boundary `I = P_max - D_max = 0` is the critical
+threshold at which the bounded update can no longer absorb incoming strain.
+This is the same structure that governs the bounded plasticity simulation —
+the supply chain is one domain instantiation of a domain-independent
+relational invariant.
+
+See also: [Bounded Plasticity Simulation](https://github.com/Relational-Relativity-Corporation/bounded-plasticity-simulation)
