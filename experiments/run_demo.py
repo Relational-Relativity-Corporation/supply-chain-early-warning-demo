@@ -1,76 +1,196 @@
-﻿import sys
+﻿"""
+run_demo.py — Supply Chain Early Warning Demo
+
+Demonstrates relational regime detection on a minimal 3-4-5
+supply network. At t=150, warehouse W1 suffers a severe capacity
+drop. The regime indicator I = P_max - D_max crosses zero before
+backlog reaches the failure threshold, providing structural
+early warning without statistical inference or tuning parameters.
+
+Usage
+-----
+    python experiments/run_demo.py
+
+Output
+------
+    Console report of trigger times and lead time.
+    Four-panel plot saved to results/regime_early_warning.png
+"""
+
+import sys
 import os
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from sc_sim.network     import build_network
-from sc_sim.flow        import simulate
 from sc_sim.disruption  import capacity_drop
-from sc_sim.instability import rolling_variance, kendall_tau_trend
-from sc_sim.metrics     import compute_trigger_times
+from sc_sim.flow        import simulate
+from sc_sim.instability import regime_series, compute_trigger_times
 
-T                = 300
-DISRUPTION_TIME  = 150
-DISRUPTION_NODE  = 'W1'
-NEW_CAPACITY     = 20.0
-BACKLOG_THRESHOLD = 200.0
-TAU_THRESHOLD    = 0.60
-ROLLING_WINDOW   = 20
-TAU_WINDOW       = 30
+# ----------------------------------------------------------------
+# Parameters
+# ----------------------------------------------------------------
+T                  = 300
+DISRUPTION_TIME    = 150
+DISRUPTION_NODE    = 'W1'
+DISRUPTION_CAP     = 20.0
+BACKLOG_THRESHOLD  = 200.0
+RESULTS_DIR        = os.path.join(os.path.dirname(__file__), '..', 'results')
 
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
-def main():
-    G          = build_network()
-    disruption = capacity_drop(DISRUPTION_NODE, NEW_CAPACITY, DISRUPTION_TIME)
-    backlog    = simulate(G, T=T, disruption_fn=disruption)
+# ----------------------------------------------------------------
+# Build network and disruption
+# ----------------------------------------------------------------
+G   = build_network()
+dfn = capacity_drop(DISRUPTION_NODE, DISRUPTION_CAP, DISRUPTION_TIME)
 
-    rv  = rolling_variance(backlog, window=ROLLING_WINDOW)
-    tau = kendall_tau_trend(rv, window=TAU_WINDOW)
+# ----------------------------------------------------------------
+# Run simulation
+# simulate() returns (backlog, G_states)
+# G_states is a list of (G_snapshot, pipelines_snapshot) per step
+# ----------------------------------------------------------------
+backlog, G_states = simulate(G, T=T, disruption_fn=dfn)
 
-    instability_t, failure_t, lead_time = compute_trigger_times(
-        backlog, tau,
-        tau_threshold=TAU_THRESHOLD,
-        backlog_threshold=BACKLOG_THRESHOLD,
+# ----------------------------------------------------------------
+# Compute regime indicator series from recorded states
+# ----------------------------------------------------------------
+I_series, D_series, P_series = regime_series(G_states)
+
+# ----------------------------------------------------------------
+# Identify trigger times
+# ----------------------------------------------------------------
+instability_time, failure_time, lead_time = compute_trigger_times(
+    backlog, I_series, backlog_threshold=BACKLOG_THRESHOLD
+)
+
+# ----------------------------------------------------------------
+# Console report
+# ----------------------------------------------------------------
+print()
+print("=" * 52)
+print("  Supply Chain Early Warning — Regime Indicator")
+print("=" * 52)
+print(f"  Disruption applied :  t = {DISRUPTION_TIME}")
+
+if instability_time is not None:
+    print(f"  Regime I < 0 at    :  t = {instability_time}  (divergent)")
+else:
+    print("  Regime I < 0       :  not reached")
+
+if failure_time is not None:
+    print(f"  Backlog threshold  :  t = {failure_time}  "
+          f"(backlog >= {BACKLOG_THRESHOLD})")
+else:
+    print("  Backlog threshold  :  not reached")
+
+if lead_time is not None:
+    print(f"  Lead time          :  {lead_time} steps before failure")
+else:
+    print("  Lead time          :  N/A")
+
+print("=" * 52)
+print()
+
+# ----------------------------------------------------------------
+# Plot — four panels
+#
+# Panel 1: Total backlog with failure threshold
+# Panel 2: Regime indicator I with zero crossing marked
+# Panel 3: D_max (relational strain) and P_max (spare capacity)
+# Panel 4: Regime zone — coloured bands for stable / critical /
+#          divergent regions to make the mathematics visible
+# ----------------------------------------------------------------
+t = np.arange(T)
+fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
+fig.suptitle(
+    'Supply Chain Early Warning — Relational Regime Indicator\n'
+    r'$I = P_{\max} - D_{\max}$   '
+    r'$I > 0$ stable   $I = 0$ critical   $I < 0$ divergent',
+    fontsize=12
+)
+
+# -- Panel 1: Backlog
+ax = axes[0]
+ax.plot(t, backlog, color='steelblue', lw=1.5, label='Total backlog')
+ax.axhline(BACKLOG_THRESHOLD, color='crimson', lw=1.2,
+           ls='--', label=f'Failure threshold ({BACKLOG_THRESHOLD})')
+ax.axvline(DISRUPTION_TIME, color='orange', lw=1.0,
+           ls=':', label=f'Disruption t={DISRUPTION_TIME}')
+if failure_time is not None:
+    ax.axvline(failure_time, color='crimson', lw=1.0,
+               ls=':', label=f'Failure t={failure_time}')
+ax.set_ylabel('Backlog (units)')
+ax.legend(fontsize=8, loc='upper left')
+ax.set_title('Total System Backlog', fontsize=10)
+
+# -- Panel 2: Regime indicator I
+ax = axes[1]
+ax.plot(t, I_series, color='darkorchid', lw=1.5, label='I = P_max − D_max')
+ax.axhline(0.0, color='black', lw=0.8, ls='--', label='Critical boundary (I = 0)')
+ax.axvline(DISRUPTION_TIME, color='orange', lw=1.0, ls=':')
+if instability_time is not None:
+    ax.axvline(instability_time, color='darkorchid', lw=1.0,
+               ls=':', label=f'I < 0 at t={instability_time}')
+if failure_time is not None:
+    ax.axvline(failure_time, color='crimson', lw=1.0, ls=':')
+ax.fill_between(t, I_series, 0,
+                where=(I_series < 0),
+                alpha=0.15, color='crimson', label='Divergent region')
+ax.fill_between(t, I_series, 0,
+                where=(I_series >= 0),
+                alpha=0.10, color='green', label='Stable region')
+ax.set_ylabel('I (regime indicator)')
+ax.legend(fontsize=8, loc='upper left')
+ax.set_title('Regime Indicator  I = P_max − D_max', fontsize=10)
+
+# -- Panel 3: D_max and P_max
+ax = axes[2]
+ax.plot(t, D_max := D_series, color='tomato',    lw=1.3, label='D_max (strain)')
+ax.plot(t, P_max := P_series, color='seagreen',  lw=1.3, label='P_max (spare capacity)')
+ax.axvline(DISRUPTION_TIME, color='orange', lw=1.0, ls=':')
+ax.set_ylabel('Normalised magnitude')
+ax.legend(fontsize=8, loc='upper left')
+ax.set_title('Relational Components', fontsize=10)
+
+# -- Panel 4: Regime zone
+ax = axes[3]
+regime = np.sign(I_series)
+colors = np.where(I_series > 0, 0.7, np.where(I_series == 0, 0.5, 0.2))
+ax.fill_between(t, -1, 1,
+                where=(I_series >= 0),
+                alpha=0.25, color='green',  label='Stable  (I > 0)')
+ax.fill_between(t, -1, 1,
+                where=(I_series < 0),
+                alpha=0.25, color='crimson', label='Divergent (I < 0)')
+ax.plot(t, np.zeros(T), color='black', lw=0.8, ls='--')
+ax.axvline(DISRUPTION_TIME, color='orange', lw=1.0, ls=':',
+           label=f'Disruption t={DISRUPTION_TIME}')
+if instability_time is not None:
+    ax.axvline(instability_time, color='darkorchid', lw=1.0, ls=':',
+               label=f'Warning  t={instability_time}')
+if failure_time is not None:
+    ax.axvline(failure_time, color='crimson', lw=1.0, ls=':',
+               label=f'Failure  t={failure_time}')
+if lead_time is not None:
+    mid = instability_time + lead_time // 2
+    ax.annotate(
+        f'{lead_time} step lead',
+        xy=(failure_time, 0), xytext=(mid, 0.6),
+        arrowprops=dict(arrowstyle='->', color='black', lw=0.8),
+        fontsize=8, ha='center'
     )
+ax.set_ylim(-1.2, 1.2)
+ax.set_ylabel('Regime zone')
+ax.set_xlabel('Time step')
+ax.legend(fontsize=8, loc='upper left')
+ax.set_title('Regime Classification', fontsize=10)
 
-    tau_val = tau[instability_t] if instability_t is not None else float('nan')
-    print(f"Kendall tau at detection:   {tau_val:.4f}")
-    print(f"Instability detected:       t = {instability_t}")
-    print(f"Failure threshold crossed:  t = {failure_t}")
-    print(f"Lead time:                  {lead_time} steps")
-
-    t_axis = np.arange(T)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
-
-    ax1.plot(t_axis, backlog, color='steelblue', lw=1.5, label='Total backlog')
-    ax1.axvline(DISRUPTION_TIME, color='crimson',    ls='--', alpha=0.7,
-                label=f'Disruption (t={DISRUPTION_TIME})')
-    if instability_t is not None:
-        ax1.axvline(instability_t, color='forestgreen', ls=':', lw=2,
-                    label=f'Instability detected (t={instability_t})')
-    if failure_t is not None:
-        ax1.axvline(failure_t, color='darkorange', ls=':', lw=2,
-                    label=f'Failure threshold (t={failure_t})')
-    ax1.axhline(BACKLOG_THRESHOLD, color='darkorange', ls='--', alpha=0.3)
-    ax1.set_ylabel('Total Network Backlog')
-    ax1.set_title('Supply Chain Early Warning — Cascade Detection')
-    ax1.legend(fontsize=8)
-
-    ax2.plot(t_axis, rv, color='darkorange', lw=1.5,
-             label=f'Rolling variance (w={ROLLING_WINDOW})')
-    if instability_t is not None:
-        ax2.axvline(instability_t, color='forestgreen', ls=':', lw=2)
-    ax2.set_ylabel('Rolling Variance of Backlog')
-    ax2.set_xlabel('Time Step')
-    ax2.legend(fontsize=8)
-
-    plt.tight_layout()
-    plt.savefig('supply_chain_early_warning.png', dpi=120)
-    plt.show()
-    print("Plot saved -> supply_chain_early_warning.png")
-
-
-if __name__ == '__main__':
-    main()
+plt.tight_layout()
+out = os.path.join(RESULTS_DIR, 'regime_early_warning.png')
+plt.savefig(out, dpi=150)
+print(f"Plot saved to: {out}")
