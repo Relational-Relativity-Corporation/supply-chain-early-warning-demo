@@ -1,97 +1,100 @@
-﻿"""
+"""
 instability.py — Relational regime detection.
 
-Replaces rolling variance and Kendall tau with the invariant
-regime indicator derived from relational magnitudes:
-
-    D_max = sup over edges of (flow / throughput_limit)
-            Maximum relational strain in the network.
-
-    P_max = inf over nodes of (spare_capacity / capacity)
-            Minimum normalized adaptive capacity available.
+Regime indicator:
 
     I = P_max - D_max
 
+    D_max = max over edges of (last dispatched / throughput_limit)
+            Measured using pipe[-1], the most recently dispatched
+            quantity in the pipeline. G_states snapshots are taken
+            before _step runs, so pipe[-1] is the dispatch from the
+            immediately preceding step — the correct index for current
+            dispatch pressure. pipe[0] would measure what arrives this
+            step, which on a delay-2 edge is dispatch from two steps
+            ago; using it would introduce a lag and understate strain
+            on supplier->warehouse edges.
+
+    P_max = min over nodes of (spare_capacity / capacity)
+            Minimum normalised spare capacity across all nodes.
+            min is intentional: it identifies the binding constraint —
+            the node whose saturation limits what the network can absorb
+            next. Mean or sum spare capacity would allow a fully
+            saturated bottleneck to be masked by slack elsewhere,
+            producing false negatives. If the tightest node is at zero
+            spare, the network cannot absorb additional strain regardless
+            of headroom at other nodes.
+
 Regimes:
-    I > 0  Stable      — plasticity exceeds strain
-    I = 0  Critical    — boundary condition
-    I < 0  Divergent   — strain exceeds available plasticity
+    I > 0  Stable    — plasticity exceeds strain
+    I = 0  Critical  — boundary condition
+    I < 0  Divergent — strain exceeds available plasticity
 
-This gives early warning by structural necessity: I crosses zero
-before backlog accumulates to failure threshold, because relational
-strain saturates capacity before downstream effects are observable.
+This is an instance of the invariant relational operator:
 
-No window parameters. No statistical thresholds. No tuning.
-The mathematics determines the regime directly from network state.
+    delta_M = clip(E - M, P_max)
+
+The stability boundary I = 0 is where the bounded update
+operator can no longer absorb incoming strain.
+
+No statistical inference, no sliding windows, no inference model
+parameters. The failure threshold (backlog_threshold) defines your
+operating constraint; the mathematics determines whether the network
+can meet it.
 """
 
 import numpy as np
 
 
-def compute_regime_indicator(G, pipelines):
+def compute_regime_indicator(G, pipelines) -> tuple:
     """
-    Compute the scalar regime indicator I = P_max - D_max
-    from current network state.
+    Compute scalar regime indicator I = P_max - D_max.
 
-    Parameters
-    ----------
-    G : networkx.DiGraph
-        Network graph with current node inventories and capacities.
-    pipelines : dict
-        Edge pipeline queues as produced by flow.init_pipelines.
+    D_max uses pipe[-1] (most recent dispatch) — see module docstring
+    for snapshot timing rationale.
+
+    P_max uses min(spare) — see module docstring for binding-constraint
+    rationale.
 
     Returns
     -------
-    I : float
-        Regime indicator. Positive = stable, zero = critical,
-        negative = divergent.
-    D_max : float
-        Maximum relational strain across all edges.
-    P_max : float
-        Minimum normalized spare capacity across all nodes.
+    I     : float — regime indicator
+    D_max : float — maximum edge strain (current dispatch pressure)
+    P_max : float — minimum node plasticity (binding constraint)
     """
-    # D_max: maximum strain = flow-in-transit / throughput_limit per edge
     strains = []
     for (u, v), pipe in pipelines.items():
         tl = G.edges[u, v]['throughput_limit']
         if tl <= 0:
-            raise ValueError(
-                f"Edge ({u}, {v}) has throughput_limit={tl}. "
-                "Zero or negative throughput limits are not permitted — "
-                "strain is undefined on a zero-capacity edge."
-            )
-        in_transit = sum(pipe)
-        strains.append(in_transit / tl)
+            raise ValueError(f"Edge ({u},{v}) throughput_limit={tl} invalid.")
+        strains.append(pipe[-1] / tl)
     D_max = max(strains) if strains else 0.0
 
-    # P_max: minimum normalized spare capacity across all nodes
     spare = []
     for nid, data in G.nodes(data=True):
         cap = data['capacity']
-        inv = data['inventory']
         if cap > 0:
-            spare.append((cap - inv) / cap)
+            spare.append((cap - data['inventory']) / cap)
     P_max = min(spare) if spare else 0.0
 
-    I = P_max - D_max
-    return I, D_max, P_max
+    return P_max - D_max, D_max, P_max
 
 
-def regime_series(G_states):
+def regime_series(G_states) -> tuple:
     """
     Compute regime indicator series over a recorded simulation run.
 
     Parameters
     ----------
-    G_states : list of (G, pipelines) tuples recorded per timestep.
+    G_states : list of (G, pipelines) tuples recorded per timestep
 
     Returns
     -------
-    I_series : np.ndarray of shape (T,)
-    D_series : np.ndarray of shape (T,)
-    P_series : np.ndarray of shape (T,)
+    I_series : np.ndarray (T,)
+    D_series : np.ndarray (T,)
+    P_series : np.ndarray (T,)
     """
-    results = [compute_regime_indicator(G, p) for G, p in G_states]
+    results  = [compute_regime_indicator(G, p) for G, p in G_states]
     I_series = np.array([r[0] for r in results])
     D_series = np.array([r[1] for r in results])
     P_series = np.array([r[2] for r in results])
@@ -99,33 +102,22 @@ def regime_series(G_states):
 
 
 def compute_trigger_times(backlog, I_series,
-                          backlog_threshold=200.0):
+                          backlog_threshold: float = 200.0) -> tuple:
     """
     Identify early-warning and failure trigger times.
 
-    Early warning fires when I first crosses zero (divergent regime).
-    Failure fires when backlog crosses backlog_threshold.
+    Early warning: first timestep where I < 0 (divergent regime).
+    Failure: first timestep where total backlog >= backlog_threshold.
 
-    Parameters
-    ----------
-    backlog : np.ndarray
-    I_series : np.ndarray
-        Regime indicator series. Negative values indicate divergence.
-    backlog_threshold : float
-
-    Returns
-    -------
-    instability_time : int or None
-    failure_time : int or None
-    lead_time : int or None
+    backlog_threshold is a user-defined operating constraint, not an
+    inference model parameter. It defines what counts as failure for
+    your system; it does not tune the detection mechanism.
     """
     instability_time = next(
-        (i for i, v in enumerate(I_series) if v < 0.0),
-        None
+        (i for i, v in enumerate(I_series) if v < 0.0), None
     )
     failure_time = next(
-        (i for i, b in enumerate(backlog) if b >= backlog_threshold),
-        None
+        (i for i, b in enumerate(backlog) if b >= backlog_threshold), None
     )
     lead_time = (
         failure_time - instability_time
